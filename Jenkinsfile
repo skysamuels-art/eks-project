@@ -1,96 +1,154 @@
+
 pipeline {
     agent any
 
     options {
-        skipDefaultCheckout(true)
+        timestamps()
         disableConcurrentBuilds()
     }
 
     environment {
         AWS_REGION = 'us-west-1'
-        ECR_REGISTRY = '060255765406.dkr.ecr.us-west-1.amazonaws.com'
-        ECR_REPOSITORY = '060255765406.dkr.ecr.us-west-1.amazonaws.com/hello-world'
+        AWS_DEFAULT_REGION = 'us-west-1'
+        AWS_ROLE_ARN = 'arn:aws:iam::060255765406:role/jenkins-eks-deployer'
+        AWS_EC2_METADATA_DISABLED = 'true'
+
         EKS_CLUSTER = 'tc2-eks'
+        ECR_REPOSITORY = 'hello-world'
+        ECR_REGISTRY = '060255765406.dkr.ecr.us-west-1.amazonaws.com'
+
+        K8S_NAMESPACE = 'default'
+        HELM_RELEASE = 'hello-world'
+        HELM_CHART = './k8s'
     }
 
     stages {
-        stage('Download application') {
+
+        stage('Checkout Source Code') {
             steps {
                 checkout scm
             }
         }
 
-        stage('Check tools and chart') {
+        stage('SonarQube Analysis') {
+            steps {
+                script {
+                    def scannerHome = tool 'SonarScanner'
+
+                    withSonarQubeEnv('SonarQube') {
+                        sh """
+                            "${scannerHome}/bin/sonar-scanner" \
+                            -Dsonar.projectKey=flask-eks-app \
+                            -Dsonar.sources=. \
+                            -Dsonar.exclusions=terraform/**,k8s/**,**/.terraform/**
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Trivy Filesystem Scan') {
             steps {
                 sh '''
-                    docker version
-                    aws --version
-                    kubectl version --client
-                    helm version
-                    helm lint ./k8s
+                    trivy fs \
+                    --scanners vuln,secret \
+                    --severity HIGH,CRITICAL \
+                    --exit-code 0 \
+                    .
                 '''
             }
         }
 
-        stage('Build Docker image') {
+        stage('Build Docker Image') {
             steps {
                 sh '''
-                    docker build -t "$ECR_REPOSITORY:jenkins-$BUILD_NUMBER" .
+                    docker build \
+                    -t "$ECR_REGISTRY/$ECR_REPOSITORY:$BUILD_NUMBER" .
                 '''
             }
         }
 
-        stage('Sign in to ECR') {
+        stage('Trivy Image Scan') {
             steps {
-                withCredentials([[
-                    $class: 'AmazonWebServicesCredentialsBinding',
-                    credentialsId: 'tech2-aws'
-                ]]) {
+                sh '''
+                    trivy image \
+                    --scanners vuln \
+                    --severity HIGH,CRITICAL \
+                    --exit-code 0 \
+                    "$ECR_REGISTRY/$ECR_REPOSITORY:$BUILD_NUMBER"
+                '''
+            }
+        }
+
+        stage('Push Docker Image to ECR') {
+            steps {
+                withCredentials([
+                    file(
+                        credentialsId: 'aws-oidc-token',
+                        variable: 'AWS_WEB_IDENTITY_TOKEN_FILE'
+                    )
+                ]) {
                     sh '''
-                        set +x
+                        set -e
+
                         aws sts get-caller-identity
 
-                        ECR_PASSWORD=$(aws ecr get-login-password --region "$AWS_REGION")
-                        printf '%s' "$ECR_PASSWORD" |
-                          docker login --username AWS --password-stdin "$ECR_REGISTRY"
-                        unset ECR_PASSWORD
+                        aws ecr get-login-password \
+                        --region "$AWS_REGION" |
+                        docker login \
+                        --username AWS \
+                        --password-stdin "$ECR_REGISTRY"
+
+                        docker push \
+                        "$ECR_REGISTRY/$ECR_REPOSITORY:$BUILD_NUMBER"
                     '''
                 }
             }
         }
 
-        stage('Upload image to ECR') {
+        stage('Deploy to Amazon EKS') {
             steps {
-                sh '''
-                    docker push "$ECR_REPOSITORY:jenkins-$BUILD_NUMBER"
-                '''
-            }
-        }
-
-        stage('Deploy to EKS') {
-            steps {
-                withCredentials([[
-                    $class: 'AmazonWebServicesCredentialsBinding',
-                    credentialsId: 'tech2-aws'
-                ]]) {
+                withCredentials([
+                    file(
+                        credentialsId: 'aws-oidc-token',
+                        variable: 'AWS_WEB_IDENTITY_TOKEN_FILE'
+                    )
+                ]) {
                     sh '''
+                        set -e
+
+                        export KUBECONFIG="$WORKSPACE/.kubeconfig"
+
                         aws eks update-kubeconfig \
-                          --region "$AWS_REGION" \
-                          --name "$EKS_CLUSTER"
+                        --region "$AWS_REGION" \
+                        --name "$EKS_CLUSTER"
 
-                        helm upgrade --install hello-world ./k8s \
-                          --namespace default \
-                          --set-string image.repository="$ECR_REPOSITORY" \
-                          --set-string image.tag="jenkins-$BUILD_NUMBER" \
-                          --wait \
-                          --timeout 10m
+                        helm upgrade --install \
+                        "$HELM_RELEASE" "$HELM_CHART" \
+                        --namespace "$K8S_NAMESPACE" \
+                        --set-string image.repository="$ECR_REGISTRY/$ECR_REPOSITORY" \
+                        --set-string image.tag="$BUILD_NUMBER" \
+                        --wait \
+                        --timeout 10m
 
-                        kubectl rollout status deployment/hello-world \
-                          --namespace default \
-                          --timeout=300s
+                        kubectl get pods -n "$K8S_NAMESPACE"
                     '''
                 }
             }
+        }
+    }
+
+    post {
+        success {
+            echo 'Flask application deployment completed successfully!'
+        }
+
+        failure {
+            echo 'Pipeline failed. Check Jenkins Console Output.'
+        }
+
+        always {
+            sh 'rm -f "$WORKSPACE/.kubeconfig"'
         }
     }
 }
