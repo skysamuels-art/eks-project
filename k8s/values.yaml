@@ -1,6 +1,6 @@
 image:
   repository: 060255765406.dkr.ecr.us-west-1.amazonaws.com/hello-world
-  tag: "v1"
+  tag: latest
 replicaCount: 1
 resources:
   requests: { cpu: 100m, memory: 64Mi }

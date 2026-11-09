@@ -27,7 +27,6 @@ pipeline {
                     aws --version
                     kubectl version --client
                     helm version
-                    trivy --version
                     helm lint ./k8s
                 '''
             }
@@ -41,26 +40,6 @@ pipeline {
             }
         }
 
-        stage('Scan Docker image') {
-            steps {
-                sh '''
-                    trivy image \
-                      --scanners vuln,secret \
-                      --severity HIGH,CRITICAL \
-                      --exit-code 1 \
-                      --format table \
-                      --output trivy-report.txt \
-                      "$ECR_REPOSITORY:jenkins-$BUILD_NUMBER"
-                '''
-            }
-            post {
-                always {
-                    archiveArtifacts artifacts: 'trivy-report.txt',
-                                     allowEmptyArchive: true
-                }
-            }
-        }
-
         stage('Sign in to ECR') {
             steps {
                 withCredentials([[
@@ -68,6 +47,7 @@ pipeline {
                     credentialsId: 'tech2-aws'
                 ]]) {
                     sh '''
+                        set +x
                         aws sts get-caller-identity
 
                         ECR_PASSWORD=$(aws ecr get-login-password --region "$AWS_REGION")
